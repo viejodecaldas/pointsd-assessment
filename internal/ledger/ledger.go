@@ -30,11 +30,21 @@ type Entry struct {
 // ErrUnavailable is returned when the ledger cannot be reached. Retrying may succeed.
 var ErrUnavailable = errors.New("ledger: unavailable")
 
+// ErrUnknownPayment means a reversal has no stored award to reverse.
+var ErrUnknownPayment = errors.New("ledger: reversal for unknown payment")
+
+// ErrNoPointsAwarded means the payment was processed but earned zero points.
+var ErrNoPointsAwarded = errors.New("ledger: payment earned no points")
+
 type Store interface {
 	HasEntry(ctx context.Context, paymentID string, kind Kind) (bool, error)
 	AwardedInMonth(ctx context.Context, memberID, month string) (int64, error)
 	Append(ctx context.Context, e Entry) error
 	Balance(ctx context.Context, memberID string) (int64, error)
+	// Award atomically deduplicates a payment, applies the cap, and stores its award.
+	Award(ctx context.Context, e Entry, monthlyCap int64) error
+	// Reverse atomically deduplicates a reversal and negates the stored award.
+	Reverse(ctx context.Context, paymentID string) error
 }
 
 type Option func(*MemoryStore)
@@ -67,12 +77,19 @@ func NewMemoryStore(opts ...Option) *MemoryStore {
 }
 
 func (s *MemoryStore) roundTrip(ctx context.Context, op string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if s.latency > 0 {
 		select {
 		case <-time.After(s.latency):
 		case <-ctx.Done():
 			return ctx.Err()
 		}
+	}
+
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	if s.faults != nil {
 		return s.faults(op)
@@ -132,4 +149,73 @@ func (s *MemoryStore) Balance(ctx context.Context, memberID string) (int64, erro
 		}
 	}
 	return total, nil
+}
+
+// Award models a database transaction: the duplicate check, cap calculation,
+// and insert share one critical section. Simulated I/O happens before locking
+// so unrelated members do not wait through each other's database latency.
+func (s *MemoryStore) Award(ctx context.Context, e Entry, monthlyCap int64) error {
+	if err := s.roundTrip(ctx, "award"); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	var used int64
+	for _, existing := range s.entries {
+		if existing.Kind != KindAward {
+			continue
+		}
+		if existing.PaymentID == e.PaymentID {
+			return nil
+		}
+		if existing.MemberID == e.MemberID && existing.Month == e.Month {
+			used += existing.Points
+		}
+	}
+	e.Kind = KindAward
+	e.Points = min(max(e.Points, 0), max(monthlyCap-used, 0))
+	// Zero-point awards still record that the payment has been processed.
+	s.entries = append(s.entries, e)
+	return nil
+}
+
+// Reverse uses the original award as the source of truth, including its member,
+// settlement month, and any cap reduction. Reversals never change monthly usage.
+func (s *MemoryStore) Reverse(ctx context.Context, paymentID string) error {
+	if err := s.roundTrip(ctx, "reverse"); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	var award Entry
+	found := false
+	for _, e := range s.entries {
+		if e.PaymentID != paymentID {
+			continue
+		}
+		if e.Kind == KindReversal {
+			return nil
+		}
+		if e.Kind == KindAward {
+			award, found = e, true
+		}
+	}
+	if !found {
+		return ErrUnknownPayment
+	}
+	if award.Points == 0 {
+		return ErrNoPointsAwarded
+	}
+	award.Kind = KindReversal
+	award.Points = -award.Points
+	s.entries = append(s.entries, award)
+	return nil
 }
